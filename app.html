@@ -1,0 +1,65 @@
+// Vercel Serverless Function — Stripe webhook handler
+// Updates user plan in Supabase when subscription changes
+
+import Stripe from 'stripe';
+
+export const config = { runtime: 'edge' };
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+const WEBHOOK_SECRET  = process.env.STRIPE_WEBHOOK_SECRET;
+const SUPABASE_URL    = process.env.SUPABASE_URL;
+const SUPABASE_KEY    = process.env.SUPABASE_SERVICE_KEY;
+
+const PRICE_TO_PLAN = {
+  [process.env.STRIPE_PRICE_STARTER]: 'starter',
+  [process.env.STRIPE_PRICE_PRO]:     'pro',
+  [process.env.STRIPE_PRICE_TEAM]:    'team',
+};
+
+export default async function handler(req) {
+  const body      = await req.text();
+  const signature = req.headers.get('stripe-signature');
+
+  let event;
+  try {
+    event = await stripe.webhooks.constructEventAsync(body, signature, WEBHOOK_SECRET);
+  } catch (err) {
+    return new Response(`Webhook Error: ${err.message}`, { status: 400 });
+  }
+
+  const updateUserPlan = async (customerId, plan) => {
+    // Look up user by stripe_customer_id
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/profiles?stripe_customer_id=eq.${customerId}&select=id`,
+      { headers: { Authorization: `Bearer ${SUPABASE_KEY}`, apikey: SUPABASE_KEY } }
+    );
+    const rows = await res.json();
+    if (!rows[0]) return;
+
+    await fetch(`${SUPABASE_URL}/rest/v1/usage?user_id=eq.${rows[0].id}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        apikey: SUPABASE_KEY,
+      },
+      body: JSON.stringify({ plan, count: 0 }) // reset monthly count on plan change
+    });
+  };
+
+  switch (event.type) {
+    case 'customer.subscription.created':
+    case 'customer.subscription.updated': {
+      const sub  = event.data.object;
+      const plan = PRICE_TO_PLAN[sub.items.data[0]?.price.id] || 'starter';
+      await updateUserPlan(sub.customer, plan);
+      break;
+    }
+    case 'customer.subscription.deleted': {
+      await updateUserPlan(event.data.object.customer, 'expired');
+      break;
+    }
+  }
+
+  return new Response('ok', { status: 200 });
+}

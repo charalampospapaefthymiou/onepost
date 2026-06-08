@@ -1,0 +1,91 @@
+// Vercel Serverless Function — onepost AI generation endpoint
+// Calls Claude API server-side so the key is never exposed to the browser
+
+export const config = { runtime: 'edge' };
+
+const CLAUDE_API_KEY = process.env.ANTHROPIC_API_KEY;
+const SUPABASE_URL   = process.env.SUPABASE_URL;
+const SUPABASE_KEY   = process.env.SUPABASE_SERVICE_KEY;
+
+const PLATFORM_PROMPTS = {
+  twitter:    'Twitter/X thread — numbered tweets with strong hooks, max 280 chars each, punchy and engaging',
+  linkedin:   'LinkedIn post — professional storytelling, 150-250 words, ends with a question to drive comments',
+  instagram:  'Instagram caption — warm and authentic, use emojis naturally, 80-120 words, 5-8 relevant hashtags at the end',
+  tiktok:     'TikTok hook/script — ultra short, pattern-interrupt opener, 50-70 words max, extremely punchy',
+  newsletter: 'Email newsletter intro — personal and warm, first-name placeholder, 80-100 words, creates curiosity for the full piece',
+};
+
+export default async function handler(req) {
+  if (req.method !== 'POST') {
+    return new Response('Method not allowed', { status: 405 });
+  }
+
+  // ── Auth check via Supabase ──
+  const authHeader = req.headers.get('Authorization');
+  if (!authHeader) return new Response('Unauthorized', { status: 401 });
+
+  const token = authHeader.replace('Bearer ', '');
+
+  // Verify user and check usage quota
+  const userRes = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    headers: { Authorization: `Bearer ${token}`, apikey: SUPABASE_KEY }
+  });
+  if (!userRes.ok) return new Response('Unauthorized', { status: 401 });
+  const user = await userRes.json();
+
+  // Check usage in DB
+  const usageRes = await fetch(
+    `${SUPABASE_URL}/rest/v1/usage?user_id=eq.${user.id}&select=count,plan`,
+    { headers: { Authorization: `Bearer ${SUPABASE_KEY}`, apikey: SUPABASE_KEY } }
+  );
+  const usageRows = await usageRes.json();
+  const usage = usageRows[0] || { count: 0, plan: 'starter' };
+
+  const limits = { starter: 50, pro: Infinity, team: Infinity };
+  if (usage.count >= limits[usage.plan]) {
+    return new Response(JSON.stringify({ error: 'Monthly limit reached. Upgrade to Pro for unlimited generations.' }), {
+      status: 429, headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  // ── Generate content ──
+  const { content } = await req.json();
+  if (!content) return new Response('Missing content', { status: 400 });
+
+  const outputs = {};
+
+  await Promise.all(Object.entries(PLATFORM_PROMPTS).map(async ([platform, prompt]) => {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': CLAUDE_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 700,
+        system: 'You are a world-class social media strategist. Rewrite the given content perfectly for the specified platform. Return ONLY the final post text, no commentary.',
+        messages: [{ role: 'user', content: `Content:\n\n${content}\n\nRewrite as: ${prompt}` }]
+      })
+    });
+    const data = await res.json();
+    outputs[platform] = data.content?.[0]?.text || 'Error generating content.';
+  }));
+
+  // ── Increment usage count ──
+  await fetch(`${SUPABASE_URL}/rest/v1/usage?user_id=eq.${user.id}`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${SUPABASE_KEY}`,
+      apikey: SUPABASE_KEY,
+    },
+    body: JSON.stringify({ count: usage.count + 1 })
+  });
+
+  return new Response(JSON.stringify(outputs), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+  });
+}
