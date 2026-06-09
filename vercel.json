@@ -1,14 +1,7 @@
 {
   "version": 2,
-  "outputDirectory": "public",
   "rewrites": [
     { "source": "/app", "destination": "/app.html" },
-    { "source": "/login", "destination": "/login.html" },
-    { "source": "/", "destination": "/index.html" }
-  ],
-  "functions": {
-    "api/*.js": {
-      "runtime": "edge"
-    }
-  }
+    { "source": "/login", "destination": "/login.html" }
+  ]
 }
